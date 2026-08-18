@@ -23,6 +23,32 @@ pm2 start ecosystem.config.cjs
 
 Runtime dependencies: Node 18+ built-ins only (fetch, http). No production deps.
 
+## Scheduler (tc365-scheduler)
+
+A companion PM2 process that punches in/out automatically on a daily schedule
+by calling the proxy locally:
+
+- Every day it rolls a plan: punch-in at `09:00` local ± `30` min, punch-out
+  `8–10h` after punch-in (both randomized once per day, persisted in
+  `scheduler-state.json` — restarts don't re-roll or double-punch).
+- Per-day locations via `TC_SCHED_DAILY` (default:
+  `mon:OFFICE,tue:OFFICE,wed:HOME,thu:OFFICE,fri:HOME,sat:HOME,sun:HOME`).
+  A day missing from the map is skipped.
+- Guards: never punches in twice, never punches out without a punch-in,
+  marks a day "missed" if the punch-in window (90 min) passes.
+- Telegram pings on punch-in/punch-out/missed — token + chat id read from the
+  proxy's `state.json` (`telegram.botToken`, `telegram.chatId`, gitignored)
+  or `TC_TG_BOT_TOKEN` / `TC_TG_CHAT_ID`.
+
+```bash
+pm2 start ecosystem.config.cjs   # starts tc365-proxy + tc365-scheduler
+pm2 logs tc365-scheduler
+```
+
+Override scheduling with env: `TC_SCHED_PUNCH_HOUR`, `TC_SCHED_JITTER_MIN`,
+`TC_SCHED_MIN_HOURS`, `TC_SCHED_MAX_HOURS`, `TC_SCHED_DAILY`, `TC_TZ`
+(default `Asia/Jerusalem`).
+
 ## Routes
 
 All JSON. Optional `TC_PROXY_KEY` gates everything behind `x-api-key`.
