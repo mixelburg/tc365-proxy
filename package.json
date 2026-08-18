@@ -1,0 +1,20 @@
+{
+  "name": "tc365-proxy",
+  "version": "2.0.0",
+  "description": "TimeClock 365 punch proxy (TypeScript) — mints tokens from user creds and exposes punch routes",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
