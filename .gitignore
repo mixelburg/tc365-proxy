@@ -1,6 +1,7 @@
 node_modules/
 dist/
 state.json
+scheduler-state.json
 .env
 *.log
 *.tsbuildinfo
