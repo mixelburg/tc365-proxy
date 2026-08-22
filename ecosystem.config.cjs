@@ -26,7 +26,14 @@ module.exports = {
         // TC_SCHED_JITTER_MIN=30
         // TC_SCHED_MIN_HOURS=8
         // TC_SCHED_MAX_HOURS=10
-        // TC_SCHED_DAILY=mon:OFFICE,tue:OFFICE,wed:HOME,thu:OFFICE,fri:HOME,sat:HOME,sun:HOME
+        // Israeli work week (Sun-Thu); fri/sat omitted = no punches:
+        TC_SCHED_DAILY: 'mon:OFFICE,tue:OFFICE,wed:HOME,thu:OFFICE,sun:HOME',
+        // Israeli holidays: skipped automatically via Hebcal (yomtov days +
+        // Yom Ha'Atzma'ut + Sigd). Overrides:
+        // TC_SKIP_HOLIDAYS=false        disable holiday skipping entirely
+        // TC_HOLIDAY_EXTRA=Atzma,Sigd   extra holiday titles to skip (add
+        //                               CH''M to also skip chol hamoed)
+        // TC_HOLIDAY_CACHE=/path        holiday cache file location
         // Telegram pings are read from <root>/state.json (telegram.botToken/chatId)
         // or from TC_TG_BOT_TOKEN / TC_TG_CHAT_ID.
       },

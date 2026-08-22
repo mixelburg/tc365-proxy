@@ -2,6 +2,7 @@ node_modules/
 dist/
 state.json
 scheduler-state.json
+holiday-cache.json
 .env
 *.log
 *.tsbuildinfo

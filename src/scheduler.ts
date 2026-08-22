@@ -13,10 +13,29 @@
 //   TC_SCHED_JITTER_MIN +/- jitter in minutes (default 30)
 //   TC_SCHED_MIN_HOURS  min shift length (default 8)
 //   TC_SCHED_MAX_HOURS  max shift length (default 10)
-//   TC_SCHED_DAILY      per-weekday location map, comma separated
+//   TC_SCHED_DAILY      per-weekday location map, comma separated. Days not
+//                       in the map are skipped (no punch). Default covers the
+//                       Israeli work week Sun-Thu:
 //                       (default mon:OFFICE,tue:OFFICE,wed:HOME,thu:OFFICE,
-//                        fri:HOME,sat:HOME,sun:HOME)
+//                        sun:HOME — fri/sat are off)
 //   TC_SCHED_STATE      plan state file (default <repo root>/scheduler-state.json)
+//   TC_SKIP_HOLIDAYS    skip punches on Israeli holidays (default true).
+//                       Holidays come from the Hebcal REST API (Israeli
+//                       schedule, i=on). A day is skipped when Hebcal marks
+//                       it yomtov (religious day off: Rosh Hashana, Yom
+//                       Kippur, Sukkot I, Shmini Atzeret, Pesach I/VII,
+//                       Shavuot) OR its title contains any of
+//                       TC_HOLIDAY_EXTRA (default covers Yom Ha'Atzma'ut
+//                       and Sigd — national days off that aren't yomtov).
+//                       Chol HaMoed and erev-chag are officially work days
+//                       in Israel, so they punch as usual; add "CH''M" to
+//                       TC_HOLIDAY_EXTRA if you want them skipped too.
+//   TC_HOLIDAY_EXTRA    comma-separated substrings matched (case-insensitive)
+//                       against Hebcal holiday titles (default Atzma,Sigd)
+//   TC_HOLIDAY_CACHE    holiday cache file (default <repo root>/holiday-cache.json).
+//                       Fetched once per Gregorian year; on network failure
+//                       the day is treated as a work day (punch as usual)
+//                       and retried with a backoff.
 //   TC_TG_BOT_TOKEN     Telegram bot token (pings). Falls back to the
 //                       `telegram` key in the proxy's state.json.
 //   TC_TG_CHAT_ID       Telegram chat id to ping.
@@ -41,11 +60,18 @@ const MIN_HOURS = Number(process.env.TC_SCHED_MIN_HOURS || 8);
 const MAX_HOURS = Number(process.env.TC_SCHED_MAX_HOURS || 10);
 const DAILY: Record<string, string> = {};
 for (const part of (process.env.TC_SCHED_DAILY ||
-  'mon:OFFICE,tue:OFFICE,wed:HOME,thu:OFFICE,fri:HOME,sat:HOME,sun:HOME').split(',')) {
+  'mon:OFFICE,tue:OFFICE,wed:HOME,thu:OFFICE,sun:HOME').split(',')) {
   const [dow, loc] = part.trim().split(':');
   if (dow) DAILY[dow.toLowerCase()] = (loc || 'HOME').toUpperCase();
 }
 const STATE_PATH = process.env.TC_SCHED_STATE || join(ROOT, 'scheduler-state.json');
+const SKIP_HOLIDAYS = String(process.env.TC_SKIP_HOLIDAYS ?? 'true') !== 'false';
+const HOLIDAY_EXTRA = (process.env.TC_HOLIDAY_EXTRA || 'Atzma,Sigd')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const HOLIDAY_CACHE_PATH = process.env.TC_HOLIDAY_CACHE || join(ROOT, 'holiday-cache.json');
+const HEBCAL_BASE = 'https://www.hebcal.com/hebcal?v=1&cfg=json&maj=on&min=off&mod=on&nx=off&ss=off&mf=off&c=off&o=off&s=off&i=on';
 const LOOP_MS = 30_000;
 const PUNCH_IN_WINDOW_MIN = 90; // late punch-in grace period after planned time
 
@@ -189,11 +215,108 @@ function fmt(ts: number): string {
   return new Date(ts).toLocaleString('en-GB', { hour12: false });
 }
 
+// ---------- Israeli holidays (Hebcal) ----------
+
+interface HolidayCache {
+  year: string; // Gregorian year this cache covers ('' if never fetched)
+  skip: Record<string, string>; // 'YYYY-MM-DD' -> holiday title
+  fetchedAt: number;
+  lastAttempt: number;
+}
+
+function loadHolidayCache(): HolidayCache {
+  const empty: HolidayCache = { year: '', skip: {}, fetchedAt: 0, lastAttempt: 0 };
+  try {
+    if (existsSync(HOLIDAY_CACHE_PATH)) {
+      const c = JSON.parse(readFileSync(HOLIDAY_CACHE_PATH, 'utf8')) as HolidayCache;
+      if (c && typeof c.skip === 'object') return c;
+    }
+  } catch (err) {
+    console.error('[scheduler] failed to load holiday cache:', (err as Error).message);
+  }
+  return empty;
+}
+
+function saveHolidayCache(cache: HolidayCache): void {
+  try {
+    mkdirSync(dirname(HOLIDAY_CACHE_PATH), { recursive: true });
+    writeFileSync(HOLIDAY_CACHE_PATH, JSON.stringify(cache, null, 2), { mode: 0o600 });
+  } catch (err) {
+    console.error('[scheduler] failed to save holiday cache:', (err as Error).message);
+  }
+}
+
+const HOLIDAY_RETRY_MS = 10 * 60_000; // backoff before re-fetching after a failure
+
+async function fetchHolidayYear(year: number): Promise<Record<string, string>> {
+  const url = `${HEBCAL_BASE}&start=${year}-01-01&end=${year}-12-31`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`Hebcal HTTP ${res.status}`);
+  const data: any = await res.json();
+  const skip: Record<string, string> = {};
+  for (const it of (data?.items || []) as any[]) {
+    if (it?.category !== 'holiday' || !it?.date || !it?.title) continue;
+    if (it.yomtov === true) {
+      skip[it.date] = it.title;
+    } else if (HOLIDAY_EXTRA.some((sub) => it.title.toLowerCase().includes(sub))) {
+      skip[it.date] = it.title;
+    }
+  }
+  return skip;
+}
+
+// Returns true when `d` is an Israeli holiday (or national day off) and
+// punches should be skipped. Never throws: on any fetch failure the day is
+// treated as a normal work day so a Hebcal outage can't cause a missed punch.
+async function isHoliday(d: Date): Promise<boolean> {
+  if (!SKIP_HOLIDAYS) return false;
+  const key = localDateKey(d);
+  const year = String(d.getFullYear());
+  const cache = loadHolidayCache();
+  if (cache.year !== year) {
+    const backoffOk = Date.now() - (cache.lastAttempt || 0) > HOLIDAY_RETRY_MS;
+    if (backoffOk) {
+      cache.lastAttempt = Date.now();
+      try {
+        cache.skip = await fetchHolidayYear(d.getFullYear());
+        cache.year = year;
+        cache.fetchedAt = Date.now();
+        console.log(`[scheduler] holiday cache refreshed for ${year}: ${Object.keys(cache.skip).length} day(s) off`);
+      } catch (err) {
+        console.error(`[scheduler] holiday fetch failed (treating days as work days): ${(err as Error).message}`);
+      }
+      saveHolidayCache(cache);
+    }
+  }
+  return key in cache.skip;
+}
+
+// Days already reported as holidays this process run (avoids log spam).
+const holidayLogged = new Set<string>();
+
 // ---------- main loop ----------
 
 async function tick(state: PlanState, tg: TgConfig): Promise<void> {
   const now = Date.now();
   const d = new Date(now);
+  const key = localDateKey(d);
+
+  // Skip punches entirely on Israeli holidays / national days off.
+  if (await isHoliday(d)) {
+    // Drop any leftover (pre-fix) plan for today so it can't fire later.
+    const existing = state[key];
+    if (existing && !existing.punchedIn) {
+      delete state[key];
+      saveState(state);
+    }
+    if (!holidayLogged.has(key)) {
+      holidayLogged.add(key);
+      const title = loadHolidayCache().skip[key] || 'holiday';
+      console.log(`[scheduler] ${key} is ${title} — skipping punches`);
+    }
+    return;
+  }
+
   const plan = planForDay(d, state);
   if (!plan) return;
 
@@ -244,7 +367,7 @@ async function tick(state: PlanState, tg: TgConfig): Promise<void> {
 async function main(): Promise<void> {
   const state = loadState();
   const tg = loadTgConfig();
-  console.log(`[scheduler] started. tz=${process.env.TZ} proxy=${PROXY_BASE} punch=${PUNCH_HOUR}:00±${JITTER_MIN}m ${MIN_HOURS}-${MAX_HOURS}h daily=${JSON.stringify(DAILY)}`);
+  console.log(`[scheduler] started. tz=${process.env.TZ} proxy=${PROXY_BASE} punch=${PUNCH_HOUR}:00±${JITTER_MIN}m ${MIN_HOURS}-${MAX_HOURS}h daily=${JSON.stringify(DAILY)} holidays=${SKIP_HOLIDAYS ? `skip (extra: ${HOLIDAY_EXTRA.join(',') || 'none'})` : 'off'}`);
   if (!tg.botToken) console.log('[scheduler] telegram pings disabled (no bot token configured)');
   // Loop forever; tick() is async and self-contained.
   setInterval(() => {
