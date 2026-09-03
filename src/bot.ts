@@ -16,7 +16,7 @@ const LOC_ICON: Record<string, string> = {
   FIELD: '🛠️',
   ABROAD: '✈️',
 };
-const LOC_CYCLE = ['OFFICE', 'HOME', 'FIELD', 'ABROAD', 'OFF'];
+const LOC_CYCLE = ['OFFICE', 'HOME', 'OFF'];
 const WEEKDAY_LABEL: Record<string, string> = {
   sun: 'Sun',
   mon: 'Mon',
@@ -397,9 +397,9 @@ export function startBot(opts: BotOptions): void {
     const cb = ctx.callback!;
     const data = cb.data || '';
     const messageId = ctx.messageId;
-    await tg.answerCallbackQuery(cb.id).catch(() => undefined);
 
     if (data.startsWith('punch:')) {
+      await tg.answerCallbackQuery(cb.id).catch(() => undefined);
       const client = pool.get(chatId);
       if (!client) {
         await tg.sendMessage(chatId, `Not registered — send /register first.`);
@@ -428,24 +428,38 @@ export function startBot(opts: BotOptions): void {
       if (!rec) return;
       const day = data.slice(3);
       if (day === 'done') {
+        // Commit & confirm — the schedule is persisted right here.
+        rec.updatedAt = Date.now();
+        saveDb(db);
+        await tg.answerCallbackQuery(cb.id, '✅ Schedule saved').catch(() => undefined);
         if (messageId) {
-          await tg.editMessageText(chatId, messageId, scheduleText(rec), { replyMarkup: null }).catch(() => undefined);
+          await tg
+            .editMessageText(chatId, messageId, scheduleText(rec) + '\n\n✅ Saved.', { replyMarkup: null })
+            .catch(() => undefined);
         }
         return;
       }
       const cur = rec.schedule.daily[day];
       const idx = cur ? LOC_CYCLE.indexOf(cur) : -1;
       const next = LOC_CYCLE[(idx + 1) % LOC_CYCLE.length];
-      if (next === 'OFF') delete rec.schedule.daily[day];
-      else rec.schedule.daily[day] = next;
+      if (next === 'OFF') {
+        delete rec.schedule.daily[day];
+        await tg.answerCallbackQuery(cb.id, `${WEEKDAY_LABEL[day]}: day off ⛔`).catch(() => undefined);
+      } else {
+        rec.schedule.daily[day] = next;
+        await tg.answerCallbackQuery(cb.id, `${WEEKDAY_LABEL[day]}: ${LOC_ICON[next] || ''}${next}`).catch(() => undefined);
+      }
       saveDb(db);
       if (messageId) {
-        await tg.editMessageText(chatId, messageId, scheduleText(rec) + `\n\nTap a day to cycle its location (⛔ = day off):`, {
+        await tg.editMessageText(chatId, messageId, scheduleText(rec) + `\n\nTap a day to change it · ✅ Done saves`, {
           replyMarkup: { inline_keyboard: scheduleButtons(rec) },
         }).catch(() => undefined);
       }
       return;
     }
+
+    // Unknown callback — just stop the spinner.
+    await tg.answerCallbackQuery(cb.id).catch(() => undefined);
   }
 
   // ---------- FSM text handling ----------
