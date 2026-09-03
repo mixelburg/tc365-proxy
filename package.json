@@ -1,14 +1,15 @@
 {
   "name": "tc365-proxy",
-  "version": "2.0.0",
-  "description": "TimeClock 365 punch proxy (TypeScript) — mints tokens from user creds and exposes punch routes",
+  "version": "3.0.0",
+  "description": "TimeClock 365 auto-punch Telegram bot — users register once, the bot punches them in/out on a per-user daily schedule and pings them (TypeScript, zero runtime deps).",
   "type": "module",
-  "main": "dist/server.js",
+  "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
-    "dev": "tsx src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "keygen": "node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
   },
   "engines": {
     "node": ">=18"

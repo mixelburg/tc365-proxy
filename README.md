@@ -1,15 +1,20 @@
-# tc365-proxy
+# tc365-proxy → tc365-bot
 
-A tiny zero-dependency-ish Node/TypeScript proxy for [TimeClock 365](https://live.timeclock365.com).
-You give it your user creds once, it mints the tokens (and auto-refreshes them),
-then you punch in/out by curling your own proxy.
+A zero-runtime-dependency TypeScript **Telegram bot** for [TimeClock 365](https://live.timeclock365.com) auto-punching.
+Users register their own TC365 account once (email + password / 2FA code) — the bot then punches them
+in/out on a **per-user daily schedule**, skips Israeli holidays, and pings each user on every punch.
 
-## Why
+One process = **Telegram bot (registration & commands) + HTTP proxy API + per-user scheduler**
+(replaces the old two-process layout: single-user `tc365-proxy` + `tc365-scheduler`).
 
-TimeClock 365's official "Open API" uses API-key auth and its docs live behind a
-login. The web app itself, however, talks to a GraphQL endpoint
-(`https://live.timeclock365.com/graphql/`) with a simple `access-token` header.
-This proxy speaks that language: email+password in, punch routes out.
+## How it works
+
+TimeClock 365's web app talks to a GraphQL endpoint (`https://live.timeclock365.com/graphql/`) with an
+`access-token` header. This bot speaks that language: it mints tokens from the user's creds
+(`POST /api/auth/login` → `/api/auth/check`), auto-refreshes them, and punches via the
+`makePunchByDashboard` GraphQL mutation. Credentials are stored **AES-256-GCM encrypted** (key from
+`TC_ENC_KEY`); access tokens are short-lived (~10 min) and refresh tokens rotate — a dead refresh
+token heals itself with a silent re-login (password-auth users) or pings the user to `/reauth` (2FA users).
 
 ## Setup
 
@@ -17,106 +22,85 @@ This proxy speaks that language: email+password in, punch routes out.
 cd ~/tc365-proxy
 npm install          # dev deps only: typescript + @types/node
 npm run build        # tsc -> dist/
-cp .env.example .env # put your creds in, or login via API
-pm2 start ecosystem.config.cjs
+cp .env.example .env # fill in TC_BOT_TOKEN + TC_ENC_KEY (see below)
+pm2 start ecosystem.config.cjs   # starts tc365-bot
 ```
 
-Runtime dependencies: Node 18+ built-ins only (fetch, http). No production deps.
+### Required env (`.env`, gitignored)
 
-## Scheduler (tc365-scheduler)
+| Var | What |
+|---|---|
+| `TC_BOT_TOKEN` | **Dedicated** bot token from [@BotFather](https://t.me/BotFather). Must not be polled by anything else (e.g. a Hermes gateway) or you get 409 conflicts. |
+| `TC_ENC_KEY` | ≥16 chars, used to encrypt stored credentials. Generate: `npm run keygen` |
 
-A companion PM2 process that punches in/out automatically on a daily schedule
-by calling the proxy locally:
+Optional: `TC_ADMIN_CHAT` (chat allowed to run `/users` & `/remove`; defaults to the migrated legacy
+account's chat), `TC_PROXY_KEY` (HTTP API key), scheduling defaults (`TC_SCHED_*` below), file paths.
 
-- Every day it rolls a plan: punch-in at `09:00` local ± `30` min, punch-out
-  `8–10h` after punch-in (both randomized once per day, persisted in
-  `scheduler-state.json` — restarts don't re-roll or double-punch).
-- Per-day locations via `TC_SCHED_DAILY` (default:
-  `mon:OFFICE,tue:OFFICE,wed:HOME,thu:OFFICE,fri:HOME,sat:HOME,sun:HOME`).
-  A day missing from the map is skipped.
-- Guards: never punches in twice, never punches out without a punch-in,
-  marks a day "missed" if the punch-in window (90 min) passes.
-- Telegram pings on punch-in/punch-out/missed — token + chat id read from the
-  proxy's `state.json` (`telegram.botToken`, `telegram.chatId`, gitignored)
-  or `TC_TG_BOT_TOKEN` / `TC_TG_CHAT_ID`.
+### v2 → v3 migration (automatic)
 
-```bash
-pm2 start ecosystem.config.cjs   # starts tc365-proxy + tc365-scheduler
-pm2 logs tc365-scheduler
-```
+On first boot with an empty `users.json`, the process migrates the old single-user layout:
+legacy account (`state.json`) → primary user attached to its ping chat; legacy daily plans
+(`scheduler-state.json`) are preserved so an in-flight day keeps its punch-out. Old files are left
+in place (back them up / delete when happy).
 
-Override scheduling with env: `TC_SCHED_PUNCH_HOUR`, `TC_SCHED_JITTER_MIN`,
-`TC_SCHED_MIN_HOURS`, `TC_SCHED_MAX_HOURS`, `TC_SCHED_DAILY`, `TC_TZ`
-(default `Asia/Jerusalem`).
+## Telegram commands
 
-## Routes
+| Command | What |
+|---|---|
+| `/register` | Sign in with your TC365 email → password (→ 2FA code if enabled). Stores your account and turns on auto-punch. |
+| `/status` | Am I punched in? Today's plan + inline Punch in/out buttons. |
+| `/punch [in\|out]` | Manual punch (default: toggle). |
+| `/schedule` | Per-weekday location editor (tap a day to cycle 🏢 OFFICE → 🏠 HOME → 🛠️ FIELD → ✈️ ABROAD → ⛔ off). |
+| `/hour 9` | Set planned punch-in hour (punch-in = `HH:00` ± jitter). |
+| `/holidays` | Toggle Israeli-holiday skipping (Hebcal: yomtov + Yom Ha'Atzma'ut + Sigd). |
+| `/reauth` | Reconnect when a session expired (2FA users after a long downtime). |
+| `/logout yes` | Remove your account — auto-punch stops. |
+| `/users`, `/remove <chatId\|email>` | Admin only. |
 
-All JSON. Optional `TC_PROXY_KEY` gates everything behind `x-api-key`.
+Defaults on registration: punch-in ~`09:00` ±30m, shift `8–10h`, work days
+`mon:OFFICE tue:OFFICE wed:HOME thu:OFFICE sun:HOME` (fri/sat off). Every punch sends the user a
+Telegram ping (`⏱ punched in …`, `🏁 punched out …`), misses get a warning.
 
-| Route | Method | Body | What it does |
+## Scheduler behaviour
+
+- Per-user plans are rolled once per day (persisted in `scheduler-state.json` — restarts don't
+  re-roll or double-punch) and executed by a 30s tick inside the bot process.
+- Guards: never punches in twice, never punches out without a punch-in, marks a day *missed* if the
+  punch-in window (90 min) passes, deletes a leftover plan on holidays.
+- Holiday list fetched once per Gregorian year from Hebcal; on fetch failure the day is treated as a
+  work day (never blocks a punch).
+
+## HTTP API (kept for scripting)
+
+Runs on `127.0.0.1:8787` by default. Selects a user via the `x-api-user` header (chat id or email);
+without the header it uses the **primary** (legacy/admin) account, so old curls keep working.
+
+| Route | Method | Body | What |
 |---|---|---|---|
-| `/auth/login` | POST | `{ "username", "password" }` | Mints tokens, stores them |
-| `/auth/login` | POST | `{ "authToken", "authCode" }` | 2nd step when 2FA (TOTP) is on |
-| `/auth/login` | POST | `{ "authToken", "emailCode" }` | 2nd step when email-code 2FA is on |
-| `/auth/refresh` | POST | — | Forces a token refresh |
-| `/auth/logout` | POST | — | Clears stored tokens |
-| `/status` | GET | — | Am I punched in? session, lunch, location types, IP |
-| `/punch` | POST | `{ "locationType"?, "taskId"? }` | Toggle: punches out if in, in if out |
-| `/punch/in` | POST | `{ "locationType"?, "taskId"? }` | Punch in |
-| `/punch/out` | POST | `{ "locationType"?, "taskId"? }` | Punch out |
-| `/me` | GET | — | Current user/company from `currentUserContext` |
-| `/health` | GET | — | Proxy alive? token state? |
+| `/health` | GET | — | service status, user count, bot state |
+| `/users` | GET | — | registered accounts (no secrets) |
+| `/auth/login` | POST | `{username, password, chatId?}` | register/replace a user's creds (chatId defaults to primary) |
+| `/auth/login` | POST | `{authToken, authCode\|emailCode}` | 2FA continuation |
+| `/auth/refresh` | POST | — | force token refresh |
+| `/auth/logout` | POST | — | remove the resolved user |
+| `/status` | GET | — | punched in? session, lunch, location types, IP |
+| `/punch` `/punch/in` `/punch/out` | POST | `{locationType?, taskId?}` | toggle / force punch |
+| `/me` | GET | — | user/company context |
 
-`locationType` is optional (`OFFICE` | `HOME` | `FIELD` | `ABROAD`); when omitted
-the proxy reuses whatever the account's current location type is.
-
-## Examples
-
-```bash
-# login once
-curl -X POST localhost:8787/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"you@company.com","password":"hunter2"}'
-
-# am I in?
-curl -s localhost:8787/status
-
-# punch in (toggle)
-curl -s -X POST localhost:8787/punch
-
-# punch in at the office, explicitly
-curl -s -X POST localhost:8787/punch/in \
-  -H 'Content-Type: application/json' -d '{"locationType":"OFFICE"}'
-
-# punch out
-curl -s -X POST localhost:8787/punch/out
-```
-
-## How it works
-
-1. `POST /api/auth/login` (REST) with `{username, client_id}` — the same first
-   step the web app makes. It returns an `auth_token` plus `auth_data.auth_type`:
-   - `password` → the proxy submits the password as `{code}` to
-     `POST /api/auth/check` with the `Auth-Token` header → tokens.
-   - `code_totp` / `code_email` → the proxy returns a `428` with the `authToken`;
-     you submit the code (`{authToken, authCode}` or `{authToken, emailCode}`)
-     and the proxy completes the same `/api/auth/check` step.
-2. Every punch is a GraphQL mutation on `https://live.timeclock365.com/graphql/`:
-   `makePunchByDashboard($punch: InputWebPunch!)` with
-   `punchType: PUNCH_IN | PUNCH_OUT`, authenticated with the `access-token` header
-   (plus the static `client-id` the web app sends).
-3. Status comes from `webPunch()` — returns the current session, so the proxy
-   knows whether to toggle in or out, and which `locationType` to reuse.
-4. Tokens persist to `state.json` (0600). Access tokens are short-lived
-   (~10 min) and refresh tokens rotate (~15 min): the proxy auto-refreshes via
-   `POST /api/auth/refresh` before expiry, and if the refresh token has died
-   (proxy idle too long), it silently re-logs-in with the stored credentials —
-   so you can punch in the morning and out in the evening without touching it.
+`locationType` is `OFFICE | HOME | FIELD | ABROAD`; when omitted the account's current location type
+is reused.
 
 ## Security notes
 
-- Defaults to `127.0.0.1`. To punch from your phone, set `HOST=0.0.0.0`
-  **and** set `TC_PROXY_KEY` (then send `x-api-key`).
-- The stored `state.json` contains live tokens — it is chmod 0600; don't commit it.
-- This proxy punches *your* account, wherever you tell it to. The TimeClock 365
-  audit log records every punch with source `WEB` and the punching IP.
+- Credentials & tokens are AES-256-GCM encrypted at rest with `TC_ENC_KEY` (users.json is chmod 0600).
+- Defaults to `127.0.0.1`; to expose the API set `HOST=0.0.0.0` **and** `TC_PROXY_KEY`.
+- Anyone who can message the bot can register *their own* TC365 account — that's by design.
+- TimeClock 365's audit log records every punch with source `WEB` and the punching IP.
+
+## Troubleshooting
+
+- **409 conflict in logs** — the bot token is being polled somewhere else (check Hermes gateways).
+  Create a fresh bot in BotFather and update `TC_BOT_TOKEN`.
+- **`🔐 … send /reauth`** — the user's tokens died (e.g. process was down longer than the refresh
+  token lifetime and the account uses 2FA). The user sends `/reauth` and their code once.
+- **Bot doesn't reply to `/start`** — confirm the process log shows `long-polling started`.

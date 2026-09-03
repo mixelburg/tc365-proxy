@@ -3,6 +3,8 @@ dist/
 state.json
 scheduler-state.json
 holiday-cache.json
+users.json
 .env
+.backup*/
 *.log
 *.tsbuildinfo
