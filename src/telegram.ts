@@ -115,6 +115,7 @@ export class Tg {
     const payload: Record<string, unknown> = {
       chat_id: chatId,
       text,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
     };
     if (opts.replyMarkup) payload.reply_markup = opts.replyMarkup;
@@ -131,6 +132,7 @@ export class Tg {
       chat_id: chatId,
       message_id: messageId,
       text,
+      parse_mode: 'HTML',
       disable_web_page_preview: true,
     };
     if (opts.replyMarkup !== undefined) payload.reply_markup = opts.replyMarkup;

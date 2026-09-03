@@ -8,6 +8,7 @@ import { authStep1, authStep2, AuthRequiredError } from './tc365-client.js';
 import type { Tg, TgHandlerContext, InlineButton } from './telegram.js';
 import { TelegramError } from './telegram.js';
 import type { Plans } from './scheduler.js';
+import { fmtTcIL } from './time.js';
 
 const LOC_ICON: Record<string, string> = {
   OFFICE: '🏢',
@@ -27,6 +28,11 @@ const WEEKDAY_LABEL: Record<string, string> = {
 };
 const DAY_ORDER = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 const FSM_TTL_MS = 15 * 60_000;
+
+/** Escape dynamic text for Telegram HTML (parse_mode=HTML is always on). */
+function esc(s: string | undefined | null): string {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 type FsmState =
   | { step: 'email' }
@@ -61,11 +67,9 @@ export function startBot(opts: BotOptions): void {
 
   // ---------- helpers ----------
 
-  function fmtDT(raw: string | undefined, fallback: string): string {
-    if (!raw) return fallback;
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return raw;
-    return d.toLocaleTimeString('en-GB', { hour12: false });
+  function fmtDT(raw: string | number | undefined, fallback: string): string {
+    // TC365 returns UTC datetimes — always render as Israel time.
+    return fmtTcIL(raw, fallback);
   }
 
   async function statusCard(client: UserClient): Promise<{ text: string; buttons: InlineButton[][] }> {
@@ -75,7 +79,7 @@ export function startBot(opts: BotOptions): void {
 
     const loc = st.locationType || (st.punchedIn ? 'OFFICE' : '—');
     const icon = LOC_ICON[loc] || '';
-    const head = `👤 ${rec.name || rec.email} ${rec.name ? `<${emailOf(rec)}>` : ''}`;
+    const head = `👤 ${esc(rec.name) || esc(rec.email)}${rec.name ? ` · ${esc(rec.email)}` : ''}`;
     const stateLine = st.punchedIn
       ? `🟢 Punched in at ${fmtDT(st.session?.startDate, '?')} ${icon}`
       : st.punchedOut
@@ -92,7 +96,7 @@ export function startBot(opts: BotOptions): void {
     let planLine = '';
     if (todayLoc && !plan?.punchedOut) {
       const target = plan
-        ? `in ~${fmtDT(new Date(plan.punchInAt).toISOString(), '')}, out ~${fmtDT(new Date(plan.punchOutAt).toISOString(), '')}`
+        ? `in ~${fmtTcIL(plan.punchInAt, '')}, out ~${fmtTcIL(plan.punchOutAt, '')}`
         : `in ~${String(sched.punchHour).padStart(2, '0')}:00±${sched.jitterMin}m`;
       planLine = `\n📅 Today (${WEEKDAY_LABEL[dow]}): ${todayLoc} · ${target}`;
     }
@@ -112,7 +116,7 @@ export function startBot(opts: BotOptions): void {
       return `${WEEKDAY_LABEL[d]} ${loc ? `${LOC_ICON[loc] || ''}${loc}` : '⛔'}`;
     }).join('  ');
     return (
-      `📅 Schedule — ${rec.name || rec.email}\n` +
+      `📅 Schedule — ${esc(rec.name) || esc(rec.email)}\n` +
       `⏰ Punch-in ~${String(s.punchHour).padStart(2, '0')}:00 ±${s.jitterMin}m · shift ${s.minHours}–${s.maxHours}h\n` +
       `${days}\n` +
       `🎗 Holidays: ${s.skipHolidays ? 'skipped (Israel)' : 'punched as usual'}`
@@ -138,12 +142,12 @@ export function startBot(opts: BotOptions): void {
 
   async function sendError(chatId: string, err: unknown): Promise<void> {
     if (err instanceof AuthRequiredError) {
-      await tg.sendMessage(chatId, `🔐 ${err.message}`);
+      await tg.sendMessage(chatId, `🔐 ${esc(err.message)}`);
     } else if (err instanceof TelegramError) {
-      await tg.sendMessage(chatId, `⚠️ ${err.message}`);
+      await tg.sendMessage(chatId, `⚠️ ${esc(err.message)}`);
     } else {
       const msg = (err as Error).message || 'something went wrong';
-      await tg.sendMessage(chatId, `⚠️ ${msg}`);
+      await tg.sendMessage(chatId, `⚠️ ${esc(msg)}`);
     }
   }
 
@@ -180,7 +184,7 @@ export function startBot(opts: BotOptions): void {
     fsm.delete(chatId);
     await tg.sendMessage(
       chatId,
-      `✅ Registered ${rec.email}${prof.name ? ` (${prof.name})` : ''}.\n\n` +
+      `✅ Registered ${esc(rec.email)}${prof.name ? ` (${esc(prof.name)})` : ''}.\n\n` +
         `Auto-punch is on: ~${String(rec.schedule.punchHour).padStart(2, '0')}:00 ±${rec.schedule.jitterMin}m, ${rec.schedule.minHours}–${rec.schedule.maxHours}h shifts, per-day locations below. You'll get a ping on each punch.\n\n` +
         `Use /status to see today's plan · /schedule to change days/locations · /hour to change the time · /punch to punch manually · /logout to remove your account.`,
     );
@@ -330,7 +334,7 @@ export function startBot(opts: BotOptions): void {
         if (!rec) return void (await tg.sendMessage(chatId, `Not registered — send /register first.`));
         const h = Number(arg);
         if (!/^\d{1,2}$/.test(arg) || h < 0 || h > 23) {
-          await tg.sendMessage(chatId, `Usage: /hour <0-23> — e.g. /hour 9 (punch-in ~09:00 ±30m).`);
+          await tg.sendMessage(chatId, `Usage: /hour 0-23 — e.g. /hour 9 (punch-in ~09:00 ±30m).`);
           return;
         }
         rec.schedule.punchHour = h;
@@ -352,7 +356,7 @@ export function startBot(opts: BotOptions): void {
         if (!isAdmin(chatId)) return void (await tg.sendMessage(chatId, `Admin only.`));
         const lines = Object.values(db.users).map((u) => {
           const days = DAY_ORDER.filter((d) => u.schedule.daily[d]).length;
-          return `• ${u.name || '—'} <${emailOf(u)}> · chat ${u.chatId} · ${days} day(s)/wk${u.chatId === adminChat ? ' · admin' : ''}`;
+          return `• ${esc(u.name) || '—'} · ${esc(u.email)} · chat ${u.chatId} · ${days} day(s)/wk${u.chatId === adminChat ? ' · admin' : ''}`;
         });
         await tg.sendMessage(chatId, `👥 ${Object.keys(db.users).length} registered user(s):\n` + (lines.join('\n') || '(none)'));
         return;
@@ -361,15 +365,15 @@ export function startBot(opts: BotOptions): void {
       case 'remove': {
         if (!isAdmin(chatId)) return void (await tg.sendMessage(chatId, `Admin only.`));
         const who = arg.trim().toLowerCase();
-        if (!who) return void (await tg.sendMessage(chatId, `Usage: /remove <chatId or email>`));
+        if (!who) return void (await tg.sendMessage(chatId, `Usage: /remove chatId-or-email`));
         const target = Object.values(db.users).find((u) => u.chatId === who || emailOf(u).toLowerCase() === who);
-        if (!target) return void (await tg.sendMessage(chatId, `No user matches "${arg}".`));
+        if (!target) return void (await tg.sendMessage(chatId, `No user matches "${esc(arg)}".`));
         if (target.chatId === adminChat) return void (await tg.sendMessage(chatId, `Can't remove the admin account.`));
         pool.invalidate(target.chatId);
         delete db.users[target.chatId];
         delete plans[target.chatId];
         saveDb(db);
-        await tg.sendMessage(chatId, `Removed ${emailOf(target)} (chat ${target.chatId}).`);
+        await tg.sendMessage(chatId, `Removed ${esc(target.email)} (chat ${target.chatId}).`);
         return;
       }
 
@@ -483,7 +487,7 @@ export function startBot(opts: BotOptions): void {
           return true;
         }
         if (!r.authToken) {
-          await tg.sendMessage(chatId, `⚠️ ${r.error || 'login failed'}`);
+          await tg.sendMessage(chatId, `⚠️ ${esc(r.error) || 'login failed'}`);
           fsm.delete(chatId);
           return true;
         }
@@ -513,7 +517,7 @@ export function startBot(opts: BotOptions): void {
     if (s.step === 'mfa') {
       const r = await authStep2(s.authToken, text.trim());
       if (!r.ok || !r.creds) {
-        await tg.sendMessage(chatId, `⚠️ ${r.error || 'code rejected'} — try again, or /cancel.`);
+        await tg.sendMessage(chatId, `⚠️ ${esc(r.error) || 'code rejected'} — try again, or /cancel.`);
         return true;
       }
       if (s.intent === 'reauth') {
@@ -566,7 +570,7 @@ export function startBot(opts: BotOptions): void {
       }
       const r = await authStep2(step1.authToken, code.trim());
       if (!r.ok || !r.creds) {
-        await tg.sendMessage(chatId, `⚠️ ${r.error || 'wrong password'} — try again, or /cancel.`);
+        await tg.sendMessage(chatId, `⚠️ ${esc(r.error) || 'wrong password'} — try again, or /cancel.`);
         return 'retry';
       }
       return r.creds;

@@ -13,6 +13,7 @@ import type { DbShape, UserRecord } from './db.js';
 import type { ClientPool, UserClient } from './tc365-client.js';
 import { AuthRequiredError } from './tc365-client.js';
 import type { Tg } from './telegram.js';
+import { fmtTcIL, fmtIL } from './time.js';
 
 const HERE = fileURLToPath(import.meta.url);
 const ROOT = HERE.includes(`${process.platform === 'win32' ? '\\' : '/'}dist${process.platform === 'win32' ? '\\' : '/'}`)
@@ -264,9 +265,9 @@ async function tickUser(
         const r = await client.punch('in', plan.location);
         plan.punchedIn = true;
         savePlans(plans);
-        const at = (r.session?.startDate as string) || fmt(now);
+        const at = fmtTcIL(r.session?.startDate, fmtIL(new Date(now)));
         console.log(`[scheduler] ${user.email} punched IN at ${at} (${plan.location})`);
-        await ping(tg, user.chatId, `⏱ punched in at ${at} (${plan.location})`);
+        await ping(tg, user.chatId, `⏱ Punched in at ${at} (${plan.location})`);
       } catch (err) {
         if (err instanceof AuthRequiredError) {
           await ping(tg, user.chatId, `🔐 Can't punch in automatically — session expired. Send /reauth to reconnect.`);
@@ -291,12 +292,12 @@ async function tickUser(
       const r = await client.punch('out');
       plan.punchedOut = true;
       savePlans(plans);
-      const at = (r.session?.endDate as string) || fmt(now);
+      const at = fmtTcIL(r.session?.endDate, fmtIL(new Date(now)));
       const workedMin = Math.round((plan.punchOutAt - plan.punchInAt) / 60_000);
       const workedH = Math.floor(workedMin / 60);
       const workedM = workedMin % 60;
       console.log(`[scheduler] ${user.email} punched OUT at ${at} (worked ${workedH}h ${workedM}m)`);
-      await ping(tg, user.chatId, `🏁 punched out at ${at} — worked ${workedH}h ${workedM}m`);
+      await ping(tg, user.chatId, `🏁 Punched out at ${at} — worked ${workedH}h ${workedM}m`);
     } catch (err) {
       if (err instanceof AuthRequiredError) {
         await ping(tg, user.chatId, `🔐 Can't punch out automatically — session expired. Send /reauth to reconnect.`);
